@@ -3,8 +3,6 @@
 ## JNI Functions:
 1: JNI function to extract digit images from main image (imageArray, W, H); output in form of (flattenImages, nImages, oW, oH)
 
-#define nv21dtype int
-
 void exampleJniFunction(nv21dtype *imageArray, int W, int H, vector<int> &flattenImages, int &nImages, int &oW, int &oH)
 
 2: JNI function to get speed value using classifier probabilities (probas)
