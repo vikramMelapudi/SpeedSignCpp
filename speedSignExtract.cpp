@@ -7,8 +7,8 @@
 #include <algorithm>
 
 using namespace std;
-#define __DEBUG_DumpFiles 1
-#define __DEBUG_Progress 1
+// #define __DEBUG_DumpFiles 1
+// #define __DEBUG_Progress 1
 
 class BBox {
   public:
@@ -31,6 +31,9 @@ class BBox {
   }
   int H() {
     return (y2-y1+1);
+  }
+  int size() {
+    return W()*H();
   }
 };
 
@@ -305,23 +308,45 @@ int clip(int val, int max, int min=0) {
     return val;
 }
 
+bool pairCompByValue(const pair<int,int>& a, const std::pair<int, int>& b) {
+    return a.second < b.second;
+}
+bool pairCompByValueFloat(const pair<int,float>& a, const std::pair<int, float>& b) {
+    return a.second < b.second;
+}
+
 class SpeedSignExtract {
     public:
-    Image lImage;
-    map<int,BBox> labelBBox;
-    map<int,Image> images;
-    int nW, nH;
+    Image lImage; // region labelled image
+    map<int,BBox> labelBBox; // bounding box of digits/object in the image
+    map<int,Image> images; // extracted image
+    int nW, nH; // final resize WxH for each image
+    // filter settings (see constructor for details)
+    float minHFrac, minWFrac, minARFrac, marginFrac, bigSizeFrac;
+    int topN;
 
     SpeedSignExtract() {
+        minHFrac = 0.28; // min height of digit as fraction of image
+        minWFrac = 0.1; // min width of digit as fraction of image
+        minARFrac = 1.1; // min aspect-ration (H/W) of digit as fraction of image
+        marginFrac = 0.05; // margin boundary defined as fraction of image
+        topN = 3; // max digit-boxes to return
+        bigSizeFrac = 0.8; // reject too big digits as fraction of image
     }
 
     void connectedComponents(Image &bImage, float thresh=127) {
+        // thresholed image (bImage) and threhold for binarization (thresh), 
+        // NOTE: if pixel>thresh then omitted i.e. only dark regions are considered as digits/objects
+        // outputs:
+        //  1. this->lImage - each pixel has unique label
+        //  2. this->labelBBox - bounding box of each label
+
         UnionFind uf;
         int label = 0;
         lImage.init(bImage.W, bImage.H, -1);
         
         #if __DEBUG_Progress>0
-        cout<<"scan thru image .."<<endl;
+        cout<<"scan thru image .."<<bImage.W<<"x"<<bImage.H<<endl;
         #endif
         int nSkip = 0;
         for(int r=0; r<bImage.H; r++) {
@@ -411,33 +436,134 @@ class SpeedSignExtract {
         #endif
     }
 
-    void extractImages(int padxy=2, int nW=28, int nH=28) {
+    void filterDigitBBoxes() {
+        int leftEnd = lImage.W*marginFrac;
+        int rightEnd = lImage.W - lImage.W*marginFrac;
+        int topEnd = lImage.H*marginFrac;
+        int botEnd = lImage.H - lImage.H*marginFrac;
+        float wThresh = lImage.W*minWFrac;
+        float hThresh = lImage.H*minHFrac;
+
+        vector<int> labelsToRemove;
+        for(map<int,BBox>::iterator it=labelBBox.begin(); it!=labelBBox.end(); ++it) {
+            int label = it->first;
+            int W = it->second.W();
+            int H = it->second.H();
+            float AR = H*1.0/W;
+            bool wOk = W>wThresh;
+            bool hOk = H>hThresh;
+            bool arOk = AR>minARFrac;
+            bool marginOk = true;
+            if((it->second.x1<leftEnd) || (it->second.x2>rightEnd)) marginOk = false;
+            if((it->second.y1<topEnd) || (it->second.y2>botEnd)) marginOk = false;
+
+            bool allOk = wOk && hOk && arOk && marginOk;
+            if(!allOk) {
+                #if __DEBUG_Progress>0
+                printf("mark label %d to remove: W:%d, H:%d, AR:%d, Margin:%d\n",label,wOk,hOk,arOk,marginOk);
+                #endif
+                labelsToRemove.push_back(label);
+            }
+        }
+
+        for(int n=0; n<labelsToRemove.size(); n++) {
+            int label = labelsToRemove[n];
+            #if __DEBUG_Progress>0
+                printf("remove label %d\n",label);
+            #endif
+            labelBBox.erase(label);
+        }
+        
+        if(labelBBox.size()>3) {
+
+            // retain only top3 by size
+            vector<int> sizes;
+            for(map<int,BBox>::iterator it=labelBBox.begin(); it!=labelBBox.end(); ++it) {
+                sizes.push_back(it->second.size());
+            }
+            std::sort(sizes.begin(), sizes.end(), std::greater<int>());
+            int szThresh = sizes[2];
+            labelsToRemove.clear();
+            for(map<int,BBox>::iterator it=labelBBox.begin(); it!=labelBBox.end(); ++it) {
+                int label = it->first;
+                if(it->second.size()<szThresh) {
+                    #if __DEBUG_Progress>0
+                        printf("mark label %d to remove by size %d < %d\n",label,it->second.size(),szThresh);
+                    #endif
+                    labelsToRemove.push_back(label);
+                }
+            }
+
+            for(int n=0; n<labelsToRemove.size(); n++) {
+                int label = labelsToRemove[n];
+                #if __DEBUG_Progress>0
+                    printf("remove label %d\n",label);
+                #endif
+                labelBBox.erase(label);
+            }
+        }
+
+        #if __DEBUG_Progress>0
+        printf("Final #labels=%d\n",labelBBox.size());
+        for(map<int,BBox>::iterator it=labelBBox.begin(); it!=labelBBox.end(); ++it) {
+            printf("labe=%d, bbox:",it->first);
+            it->second.print(stdout);
+            printf("\n");
+        }
+        #endif
+    }
+
+    void extractImages(Image &origImage, int padxy=2, int nW=28, int nH=28) {
+        // extract image of nWxnH size with padding of padxy for each labelBBox entry
+        // output:
+        //  1. this->images 
+
         this->nW = nW;
         this->nH = nH;
+
+        // arrange bbox by x-position (left to right)
+        vector<pair<int,int>> labelLeftPos;
+        for(map<int,BBox>::iterator it=labelBBox.begin(); it!=labelBBox.end(); ++it) {
+            labelLeftPos.push_back(pair<int,int>(it->first,it->second.x1));
+        }
+        std::sort(labelLeftPos.begin(), labelLeftPos.end(), pairCompByValue);
+        map<int,int> label2index;
+        for(int n=0; n<labelLeftPos.size(); n++) label2index[labelLeftPos[n].first] = n;
         
-        // initialize images for each label
+        #if __DEBUG_Progress>0
+        printf("initialize images for each label\n");
+        #endif
         for(map<int,BBox>::iterator it=labelBBox.begin(); it!=labelBBox.end(); ++it) {
             int label = it->first;
             if(label==-1) continue;
             int W = it->second.W() + padxy*2;
             int H = it->second.H() + padxy*2;
-            images[label].init(W,H,0);
+            int index = label2index[label];
+            images[index].init(W,H,0);
             #if __DEBUG_Progress>0
-            cout<<"label:"<<label<<", "<<W<<", "<<H<<endl;
+            cout<<"label:"<<label<<", "<<W<<", "<<H<<", index="<<index<<endl;
             #endif
         }
-        // fill image for each label
+
+        #if __DEBUG_Progress>0
+        printf("fill image for each label\n");
+        #endif
         for(int r=0; r<lImage.H; r++) {
             for(int c=0; c<lImage.W; c++) {
                 int label = lImage.index(c,r);
-                if(label==-1) continue;
+                if(label==-1) continue; // background label
+                if(labelBBox.find(label)==labelBBox.end()) continue; // label has been filtered out
                 int lc = c - labelBBox[label].x1 + padxy;
                 int lr = r - labelBBox[label].y1 + padxy;
-                images[label].set(lc,lr,255);
+                int index = label2index[label];
+                images[index].set(lc,lr, 255-origImage.index(c,r));
             }
         }
-        // resize each label image
-        for(map<int,BBox>::iterator it=labelBBox.begin(); it!=labelBBox.end(); ++it) {
+
+        #if __DEBUG_Progress>0
+        printf("resize each label image\n");
+        #endif
+        for(map<int,Image>::iterator it=images.begin(); it!=images.end(); ++it) {
             int label = it->first;
             if(label==-1) continue;
             #if __DEBUG_Progress>0
@@ -450,8 +576,7 @@ class SpeedSignExtract {
             char fname[100];
             sprintf(fname,"tests/label_%d.out",label);
             images[label].dump2File(fname);
-            #endif
-            
+            #endif   
         }
     }
 
@@ -474,31 +599,78 @@ class SpeedSignExtract {
                 gn += 1;
             }
         }
+        /*
         FILE *fp = fopen("tests/test_flatten.out","w");
         int noff = 0;
         for(int nimg=0;nimg<images.size();nimg++) {
             for(int n=0;n<nW*nH*1.5;n++) fprintf(fp,"%d,",flatData[noff++]);
         }
         fclose(fp);
+        */
     }
 };
+
+
+int getSpeedValue(float *probas, int nPreds) {
+    const int nClasses = 11;
+    vector<int> firsts;
+    vector<int> seconds;
+
+    int offset = 0;
+    bool isValidNo = false;
+    for(int np=0; np<nPreds; np++) {
+        vector<pair<int,float>> indexProba;
+        for(int n=0;n<nClasses;n++) {
+            indexProba.push_back(pair<int,float>(n, probas[n+offset]));
+        }
+        offset += nClasses;
+        std::sort(indexProba.begin(), indexProba.end(), pairCompByValueFloat);
+
+        int val = indexProba[nClasses-1].first;
+        if(val<10) isValidNo = true; // if any of the entries has digit, isValidNo = true
+        firsts.push_back(indexProba[nClasses-1].first);
+        seconds.push_back(indexProba[nClasses-2].first); // note down 2nd choice to override when isValidNo=true
+    }
+
+    int speedValue = -1;
+    if(isValidNo) {
+        speedValue = 0;
+        int mult = 1;
+        for(int n=nPreds-1; n>=0; n--) {
+            int dval = firsts[n];
+            if(dval==10) dval = seconds[n]; // forcibly convert non-digit to digit (by 2nd best choice)
+            speedValue += dval*mult;
+            mult *= 10;
+        }
+    }
+    return speedValue;
+}
+
+// Exampel JNI function calls
 
 #define nv21dtype int
 void exampleJniFunction(nv21dtype *imageArray, int W, int H, vector<int> &flattenImages, int &nImages, int &oW, int &oH) {
     Image image(W,H,imageArray); // create Image object
+    Image origImage(W,H,imageArray); // create Image object
     SpeedSignExtract sobj; // initialize extraction object
 
-    image.adaptiveGaussianThreshold(); // binarize the image
+    int kSz = (int)(29.0*H/100); // kernel size for adaptive thresholding
+    image.adaptiveGaussianThreshold(kSz, -7); // binarize the image
     sobj.connectedComponents(image, 127); // apply connected components
-    sobj.extractImages(); // extract invidual images
+    sobj.filterDigitBBoxes();
+    sobj.extractImages(origImage); // extract invidual images
     
     sobj.flatten(flattenImages, nImages, oW, oH); // get flattened YUV images
+}
+
+void exampleJniSpeedValue(float *probas, int nPreds, int &speedValue) {
+    speedValue = getSpeedValue(probas, nPreds);
 }
 
 int main(int argc, char *argv[]) {
 
     printf("Usage: %s <mode> <input .dat> \n",argv[0]);
-    printf("    mode: 0 for general processing, 1 for JNI simulation\n");
+    printf("    mode: 0 for general processing, 1 for JNI simulation, 2 for speedValue verification\n");
     printf("\n");
 
     if(argc<2) {
@@ -529,6 +701,22 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
+    if (mode=='2') {
+        FILE *fp = fopen(argv[2],"r");
+        int nPreds, nClasses;
+        fscanf(fp,"%d,%d",&nPreds,&nClasses);
+        printf("nPreds=%d, nClasses=%d\n",nPreds,nClasses);
+        float *probas = new float[nPreds*nClasses];
+        for(int n=0;n<nPreds*nClasses; n++) fscanf(fp,",%e",&probas[n]);
+        fclose(fp);
+
+        int speedValue;
+        exampleJniSpeedValue(probas, nPreds, speedValue);
+        printf("\nSpeed Value = %d\n\n", speedValue);
+
+        return 0;
+    }
+
     int w,h;
     Image image;
     // image.fromFile("../../data/SpeedSign/testImage123.dat");
@@ -546,10 +734,10 @@ int main(int argc, char *argv[]) {
 
     testUnionFind();
 
-    image.adaptiveGaussianThreshold();
+    image.adaptiveGaussianThreshold(11,5);
     image.dump2File("tests/adaptfilt_image.out");
     sobj.connectedComponents(image, 127);
-    sobj.extractImages();
+    sobj.extractImages(image);
     
     cout<<"done.";
     return 0;
