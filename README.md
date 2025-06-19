@@ -8,6 +8,10 @@ void exampleJniFunction(nv21dtype *imageArray, int W, int H, vector<int> &flatte
 2: JNI function to get speed value using classifier probabilities (probas)
 void exampleJniSpeedValue(float *probas, int nPreds, int &speedValue)
 
+## DL Model
+DLModel folder contains files from tf.saved_model.save(..)
+verify.ipynb has a cell to load and infer with this model
+
 ## Example execution
 1. Process NV21 image to get separated digit images, each should be used with classifier
 ./a.exe 1 tests/exInputs/ssimg_1931_120.dat --> create flatImages.dat
