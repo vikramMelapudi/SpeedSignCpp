@@ -9,6 +9,7 @@
 using namespace std;
 // #define __DEBUG_DumpFiles 1
 // #define __DEBUG_Progress 1
+#define __UseResizeLinear 1
 
 class BBox {
   public:
@@ -118,6 +119,11 @@ class Image {
     }
 
     void resize(Image &dstImage, int nW, int nH) {
+        #if __UseResizeLinear>0
+        resizeLinear(dstImage, nW, nH);
+        return;
+        #endif
+
         dstImage.init(nW,nH,0);
         float wSc = (W-1)*1.0f/(nW-1);
         float hSc = (H-1)*1.0f/(nH-1);
@@ -126,6 +132,41 @@ class Image {
                 int sr = (int)(r*hSc);
                 int sc = (int)(c*wSc);
                 dstImage.set(c,r,index(sc,sr));
+            }
+        }
+    }
+
+    void resizeLinear(Image &dstImage, int nW, int nH) {
+        // neighbour map
+        const int cdel[] = {0,0,1,1};
+        const int rdel[] = {0,1,0,1};
+
+        dstImage.init(nW,nH,0);
+        float wSc = (W-1)*1.0f/(nW-1);
+        float hSc = (H-1)*1.0f/(nH-1);
+        for(int r=0; r<nH; r++) {
+            for(int c=0; c<nW; c++) {
+                // location in source image
+                float ir = r*hSc;
+                float ic = c*wSc;
+                // left, top most pixel in source image
+                int sr = (int)ir;
+                int sc = (int)ic;
+                // compute distance weighted average pixel value
+                float val = 0;
+                float norm = 0;
+                for(int nn=0; nn<4; nn++) {
+                    int rr = sr+rdel[nn]; if(rr>=H) rr=H-1;
+                    int cc = sc+cdel[nn]; if(cc>=W) cc=W-1;
+                    float d = 2.0 - (abs(rr-ir)+abs(cc-ic)); // exact pixel map will have weight 2.0 and others <2.0
+                    norm += d;
+                    val += d*index(cc,rr);
+                }
+                // normalize with weights
+                val = val/norm;
+
+                // assign normalized weighted sum
+                dstImage.set(c, r, val);
             }
         }
     }
@@ -521,6 +562,9 @@ class SpeedSignExtract {
         this->nW = nW;
         this->nH = nH;
 
+        int wPad = (int)padxy * nW*1.0/28;
+        int hPad = (int)padxy * nH*1.0/28;
+
         // arrange bbox by x-position (left to right)
         vector<pair<int,int>> labelLeftPos;
         for(map<int,BBox>::iterator it=labelBBox.begin(); it!=labelBBox.end(); ++it) {
@@ -536,8 +580,8 @@ class SpeedSignExtract {
         for(map<int,BBox>::iterator it=labelBBox.begin(); it!=labelBBox.end(); ++it) {
             int label = it->first;
             if(label==-1) continue;
-            int W = it->second.W() + padxy*2;
-            int H = it->second.H() + padxy*2;
+            int W = it->second.W() + wPad*2;
+            int H = it->second.H() + hPad*2;
             int index = label2index[label];
             images[index].init(W,H,0);
             #if __DEBUG_Progress>0
@@ -553,8 +597,8 @@ class SpeedSignExtract {
                 int label = lImage.index(c,r);
                 if(label==-1) continue; // background label
                 if(labelBBox.find(label)==labelBBox.end()) continue; // label has been filtered out
-                int lc = c - labelBBox[label].x1 + padxy;
-                int lr = r - labelBBox[label].y1 + padxy;
+                int lc = c - labelBBox[label].x1 + wPad;
+                int lr = r - labelBBox[label].y1 + hPad;
                 int index = label2index[label];
                 images[index].set(lc,lr, 255-origImage.index(c,r));
             }
@@ -658,7 +702,7 @@ void exampleJniFunction(nv21dtype *imageArray, int W, int H, vector<int> &flatte
     image.adaptiveGaussianThreshold(kSz, -7); // binarize the image
     sobj.connectedComponents(image, 127); // apply connected components
     sobj.filterDigitBBoxes();
-    sobj.extractImages(origImage); // extract invidual images
+    sobj.extractImages(origImage, 0, 28, 28); // extract invidual images
     
     sobj.flatten(flattenImages, nImages, oW, oH); // get flattened YUV images
 }
